@@ -32,7 +32,7 @@ set_seed(42)
 # 하이퍼파라미터 정의
 # 훈련 데이터 전체를 LOOKBACK, 테스트 데이터 전체를 PREDICT 기간으로 설정
 BATCH_SIZE = 16
-EPOCHS = 50
+EPOCHS = 200
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # --- 1. 데이터 로드 및 병합 ---
