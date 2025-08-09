@@ -62,8 +62,25 @@ menu_counts = train_raw_df['영업장명_메뉴명'].value_counts()
 most_frequent_menu = menu_counts.idxmax()
 print(f"가장 많은 기록이 있는 메뉴: '{most_frequent_menu}'를 선택했습니다.")
 
+# 영업장명과 메뉴명 분리
+train_raw_df[['영업장명', '메뉴명']] = train_raw_df['영업장명_메뉴명'].str.split('_', n=1, expand=True)
+
+# 계절성 특성 생성 함수
+def get_seasonality(menu_name):
+    summer_keywords = ['냉면', '비빔밥', '에이드', '아이스크림', '아이스']
+    winter_keywords = ['찌개', '탕', '국밥', '우동', '핫']
+    menu_name_lower = menu_name.lower()
+    if any(keyword in menu_name_lower for keyword in summer_keywords):
+        return 1  # 여름
+    if any(keyword in menu_name_lower for keyword in winter_keywords):
+        return 2  # 겨울
+    return 0  # 계절 무관
+
+train_raw_df['seasonality'] = train_raw_df['메뉴명'].apply(get_seasonality)
+
 train_menu_df = train_raw_df[train_raw_df['영업장명_메뉴명'] == most_frequent_menu].copy()
-train_menu_df = train_menu_df['매출수량'].resample('D').sum().fillna(0).to_frame()
+train_menu_df = train_menu_df.resample('D').first().fillna(method='ffill').fillna(0)
+train_menu_df = train_menu_df[['매출수량', 'seasonality']].fillna({'매출수량': 0, 'seasonality': 0})
 train_menu_df.rename(columns={'매출수량': 'y'}, inplace=True)
 
 # 병합된 테스트 데이터 전처리
@@ -71,8 +88,13 @@ test_raw_df['영업일자'] = pd.to_datetime(test_raw_df['영업일자'])
 test_raw_df.set_index('영업일자', inplace=True)
 test_raw_df.sort_index(inplace=True)
 
+# 영업장명과 메뉴명 분리
+test_raw_df[['영업장명', '메뉴명']] = test_raw_df['영업장명_메뉴명'].str.split('_', n=1, expand=True)
+test_raw_df['seasonality'] = test_raw_df['메뉴명'].apply(get_seasonality)
+
 test_menu_df = test_raw_df[test_raw_df['영업장명_메뉴명'] == most_frequent_menu].copy()
-test_menu_df = test_menu_df['매출수량'].resample('D').sum().fillna(0).to_frame()
+test_menu_df = test_menu_df.resample('D').first().fillna(method='ffill').fillna(0)
+test_menu_df = test_menu_df[['매출수량', 'seasonality']].fillna({'매출수량': 0, 'seasonality': 0})
 test_menu_df.rename(columns={'매출수량': 'y'}, inplace=True)
 
 # LOOKBACK과 PREDICT 기간 정의
@@ -82,13 +104,21 @@ print(f"LOOKBACK 기간: {LOOKBACK}일 (train.csv 전체)")
 print(f"PREDICT 기간: {PREDICT}일 (TEST_00 ~ TEST_09 전체)")
 
 # 훈련 데이터와 테스트 데이터 스케일링
-scaler = MinMaxScaler(feature_range=(0, 1))
-scaled_train_data = scaler.fit_transform(train_menu_df['y'].values.reshape(-1, 1))
-scaled_test_data = scaler.transform(test_menu_df['y'].values.reshape(-1, 1))
+y_scaler = MinMaxScaler(feature_range=(0, 1))
+y_scaler.fit(train_menu_df['y'].values.reshape(-1, 1))
+scaled_train_y = y_scaler.transform(train_menu_df['y'].values.reshape(-1, 1))
+scaled_test_y = y_scaler.transform(test_menu_df['y'].values.reshape(-1, 1))
+
+# 계절성 특성 스케일링 (값의 범위가 0, 1, 2이므로 스케일링을 적용)
+seasonality_scaler = MinMaxScaler(feature_range=(0, 1))
+seasonality_scaler.fit(train_menu_df['seasonality'].values.reshape(-1, 1))
+scaled_train_seasonality = seasonality_scaler.transform(train_menu_df['seasonality'].values.reshape(-1, 1))
+scaled_test_seasonality = seasonality_scaler.transform(test_menu_df['seasonality'].values.reshape(-1, 1))
 
 # 단일 훈련 데이터셋 생성 (train 데이터를 보고 test 데이터를 예측하도록)
-X_train_np = scaled_train_data.reshape(1, LOOKBACK)
-Y_train_np = scaled_test_data.reshape(1, PREDICT)
+# X는 y와 seasonality를 모두 포함
+X_train_np = np.concatenate((scaled_train_y, scaled_train_seasonality), axis=1).reshape(1, LOOKBACK, -1)
+Y_train_np = scaled_test_y.reshape(1, PREDICT)
 
 # NumPy 배열을 PyTorch 텐서로 변환
 X_train = torch.FloatTensor(X_train_np).to(DEVICE)
@@ -96,7 +126,7 @@ Y_train = torch.FloatTensor(Y_train_np).to(DEVICE)
 
 # --- 3. Transformer 모델 정의 및 학습 ---
 class TransformerPredictor(nn.Module):
-    def __init__(self, input_dim=1, d_model=64, nhead=4, num_encoder_layers=2, output_dim=PREDICT):
+    def __init__(self, input_dim=2, d_model=64, nhead=4, num_encoder_layers=2, output_dim=PREDICT):
         super(TransformerPredictor, self).__init__()
         self.d_model = d_model
 
@@ -112,7 +142,7 @@ class TransformerPredictor(nn.Module):
         return self.fc_out(x[:, -1, :]) # 마지막 토큰의 출력을 사용하여 예측
 
 print("\n3. Transformer 모델 학습을 시작합니다.")
-input_dim = 1
+input_dim = 2 # 매출 수량(y) + 계절성(seasonality)
 d_model = 64
 nhead = 4
 num_encoder_layers = 2
@@ -125,7 +155,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 for epoch in tqdm(range(EPOCHS), desc="Training Progress"):
     model.train()
     optimizer.zero_grad()
-    y_pred = model(X_train.unsqueeze(2))
+    y_pred = model(X_train)
     loss = loss_function(y_pred, Y_train)
     loss.backward()
     optimizer.step()
@@ -135,14 +165,14 @@ print("Transformer 모델 학습이 완료되었습니다.")
 # --- 4. 단일 예측 및 평가 ---
 print("\n4. TEST_00.csv부터 TEST_09.csv 전체 데이터로 예측을 수행하고 평가합니다.")
 # 예측을 위해 훈련 데이터 전체를 사용
-train_sequence_for_pred = torch.FloatTensor(scaled_train_data).to(DEVICE).unsqueeze(0)
+train_sequence_for_pred = X_train
 
 model.eval()
 with torch.no_grad():
     transformer_predictions_scaled = model(train_sequence_for_pred).cpu().numpy().flatten()
     
     # 예측된 스케일링 값을 원래 스케일로 되돌림
-    transformer_predictions = scaler.inverse_transform(transformer_predictions_scaled.reshape(-1, 1)).flatten()
+    transformer_predictions = y_scaler.inverse_transform(transformer_predictions_scaled.reshape(-1, 1)).flatten()
     transformer_predictions[transformer_predictions < 0] = 0
     actual_test_values = test_menu_df['y'].values
 
