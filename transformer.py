@@ -14,7 +14,7 @@ from sklearn.metrics import mean_squared_error
 
 def set_seed(seed=42):
     """
-    Sets a random seed to ensure reproducibility.
+    재현성을 위해 랜덤 시드를 설정합니다.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -29,32 +29,31 @@ def set_seed(seed=42):
 
 set_seed(42)
 
-# Define hyperparameters
-LOOKBACK = 28   # 예측을 위해 고려할 과거 데이터 기간
-PREDICT = 7     # 예측할 미래 기간
+# 하이퍼파라미터 정의
+# 훈련 데이터 전체를 LOOKBACK, 테스트 데이터 전체를 PREDICT 기간으로 설정
 BATCH_SIZE = 16
 EPOCHS = 50
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# --- 1. 데이터 로드 및 분리 ---
-print("1. 데이터를 구글 드라이브에서 로드하고 훈련/테스트 데이터로 분리합니다.")
+# --- 1. 데이터 로드 및 병합 ---
+print("1. 데이터를 구글 드라이브에서 로드하고 테스트 데이터를 병합합니다.")
 DATA_PATH = '/content/drive/MyDrive/hackathon_data'
 
 try:
     train_file = os.path.join(DATA_PATH, 'train.csv')
-    test_files = [os.path.join(DATA_PATH, f'TEST_{i:02d}.csv') for i in range(10)]
+    test_files = sorted(glob.glob(os.path.join(DATA_PATH, 'TEST_*.csv')))
 
-    train_raw_df = pd.read_csv(train_file)
-    test_raw_dfs = [pd.read_csv(f) for f in test_files]
-    test_raw_df = pd.concat(test_raw_dfs, ignore_index=True)
+    train_raw_df = pd.read_csv(train_file, encoding='utf-8')
+    test_dfs = [pd.read_csv(f, encoding='utf-8') for f in test_files]
+    test_raw_df = pd.concat(test_dfs, ignore_index=True)
 
-    print("훈련/테스트 데이터 로드 완료.")
+    print("훈련/테스트 데이터 로드 및 병합 완료.")
 except FileNotFoundError as e:
     print(f"오류: 파일을 찾을 수 없습니다. 구글 드라이브 마운트 및 경로를 확인해 주세요. 오류: {e}")
     exit()
 
-# --- 2. 훈련 데이터 전처리 ---
-print("\n2. 훈련 데이터 전처리 및 스케일링을 수행합니다.")
+# --- 2. 훈련 데이터 전처리 및 모델 학습 ---
+print("\n2. 훈련 데이터 전처리 및 스케일링을 수행하고 모델을 학습합니다.")
 train_raw_df['영업일자'] = pd.to_datetime(train_raw_df['영업일자'])
 train_raw_df.set_index('영업일자', inplace=True)
 train_raw_df.sort_index(inplace=True)
@@ -67,29 +66,37 @@ train_menu_df = train_raw_df[train_raw_df['영업장명_메뉴명'] == most_freq
 train_menu_df = train_menu_df['매출수량'].resample('D').sum().fillna(0).to_frame()
 train_menu_df.rename(columns={'매출수량': 'y'}, inplace=True)
 
-# 훈련 데이터 스케일링
+# 병합된 테스트 데이터 전처리
+test_raw_df['영업일자'] = pd.to_datetime(test_raw_df['영업일자'])
+test_raw_df.set_index('영업일자', inplace=True)
+test_raw_df.sort_index(inplace=True)
+
+test_menu_df = test_raw_df[test_raw_df['영업장명_메뉴명'] == most_frequent_menu].copy()
+test_menu_df = test_menu_df['매출수량'].resample('D').sum().fillna(0).to_frame()
+test_menu_df.rename(columns={'매출수량': 'y'}, inplace=True)
+
+# LOOKBACK과 PREDICT 기간 정의
+LOOKBACK = len(train_menu_df)
+PREDICT = len(test_menu_df)
+print(f"LOOKBACK 기간: {LOOKBACK}일 (train.csv 전체)")
+print(f"PREDICT 기간: {PREDICT}일 (TEST_00 ~ TEST_09 전체)")
+
+# 훈련 데이터와 테스트 데이터 스케일링
 scaler = MinMaxScaler(feature_range=(0, 1))
 scaled_train_data = scaler.fit_transform(train_menu_df['y'].values.reshape(-1, 1))
+scaled_test_data = scaler.transform(test_menu_df['y'].values.reshape(-1, 1))
 
-# --- 3. Transformer 데이터셋 생성 ---
-def create_dataset(dataset, lookback, predict):
-    X, Y = [], []
-    for i in range(len(dataset) - lookback - predict + 1):
-        feature_sequence = dataset[i:(i + lookback), 0]
-        label_sequence = dataset[(i + lookback):(i + lookback + predict), 0]
-        X.append(feature_sequence)
-        Y.append(label_sequence)
-    return np.array(X), np.array(Y)
-
-X_train_np, Y_train_np = create_dataset(scaled_train_data, LOOKBACK, PREDICT)
+# 단일 훈련 데이터셋 생성 (train 데이터를 보고 test 데이터를 예측하도록)
+X_train_np = scaled_train_data.reshape(1, LOOKBACK)
+Y_train_np = scaled_test_data.reshape(1, PREDICT)
 
 # NumPy 배열을 PyTorch 텐서로 변환
 X_train = torch.FloatTensor(X_train_np).to(DEVICE)
 Y_train = torch.FloatTensor(Y_train_np).to(DEVICE)
 
-# --- 4. Transformer 모델 정의 및 학습 ---
+# --- 3. Transformer 모델 정의 및 학습 ---
 class TransformerPredictor(nn.Module):
-    def __init__(self, input_dim=1, d_model=64, nhead=4, num_encoder_layers=2, output_dim=7):
+    def __init__(self, input_dim=1, d_model=64, nhead=4, num_encoder_layers=2, output_dim=PREDICT):
         super(TransformerPredictor, self).__init__()
         self.d_model = d_model
 
@@ -125,50 +132,39 @@ for epoch in tqdm(range(EPOCHS), desc="Training Progress"):
 
 print("Transformer 모델 학습이 완료되었습니다.")
 
-# --- 5. 테스트 데이터 전처리 및 예측 ---
-print("\n4. 테스트 데이터로 예측을 수행합니다.")
-test_raw_df['영업일자'] = pd.to_datetime(test_raw_df['영업일자'])
-test_raw_df.set_index('영업일자', inplace=True)
-test_raw_df.sort_index(inplace=True)
-test_menu_df = test_raw_df[test_raw_df['영업장명_메뉴명'] == most_frequent_menu].copy()
-test_menu_df = test_menu_df['매출수량'].resample('D').sum().fillna(0).to_frame()
-test_menu_df.rename(columns={'매출수량': 'y'}, inplace=True)
-
-# 예측을 위해 훈련 데이터의 마지막 LOOKBACK 기간을 사용
-last_train_sequence = scaled_train_data[-LOOKBACK:]
-last_train_tensor = torch.FloatTensor(last_train_sequence).to(DEVICE).unsqueeze(0)
+# --- 4. 단일 예측 및 평가 ---
+print("\n4. TEST_00.csv부터 TEST_09.csv 전체 데이터로 예측을 수행하고 평가합니다.")
+# 예측을 위해 훈련 데이터 전체를 사용
+train_sequence_for_pred = torch.FloatTensor(scaled_train_data).to(DEVICE).unsqueeze(0)
 
 model.eval()
 with torch.no_grad():
-    transformer_predictions_scaled = model(last_train_tensor).cpu().numpy().flatten()
-
-    # 예측된 스케일링 값을 원래 스케일로 되돌립니다.
+    transformer_predictions_scaled = model(train_sequence_for_pred).cpu().numpy().flatten()
+    
+    # 예측된 스케일링 값을 원래 스케일로 되돌림
     transformer_predictions = scaler.inverse_transform(transformer_predictions_scaled.reshape(-1, 1)).flatten()
+    transformer_predictions[transformer_predictions < 0] = 0
+    actual_test_values = test_menu_df['y'].values
 
-transformer_predictions[transformer_predictions < 0] = 0
-
-# --- 6. 평가 및 시각화 ---
+# --- 5. 최종 평가 및 시각화 ---
 def smape(y_true, y_pred):
     return np.mean(2 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred) + 1e-8)) * 100
 
-# 테스트 데이터의 첫 PREDICT 기간을 예측 대상 실제값으로 사용
-actual_test_values = test_menu_df['y'].iloc[:PREDICT].values
-smape_value = smape(actual_test_values, transformer_predictions)
+final_smape = smape(actual_test_values, transformer_predictions)
 
 print("\n--- 최종 예측 결과 ---")
-print("Transformer 모델을 활용한 다음 1주일 메뉴 판매량 예측:")
-print(pd.Series(transformer_predictions, index=test_menu_df.index[:PREDICT]))
-print(f"\n테스트 데이터의 실제 판매량:\n{actual_test_values}")
-print(f"\n테스트 데이터에 대한 SMAPE: {smape_value:.2f}%")
+print(f"TEST_00.csv부터 TEST_09.csv 전체 예측에 대한 최종 SMAPE: {final_smape:.2f}%")
 
-print("\n5. 예측 결과 시각화를 생성합니다.")
-fig, ax = plt.subplots(figsize=(15, 7))
+print("\n6. 예측 결과 시각화를 생성합니다.")
+fig, ax = plt.subplots(figsize=(20, 10))
 ax.plot(train_menu_df.index, train_menu_df['y'], label='실제 판매량 (훈련)', color='blue')
-ax.plot(test_menu_df.index[:PREDICT], actual_test_values, label='실제 판매량 (테스트)', color='green')
-ax.plot(test_menu_df.index[:PREDICT], transformer_predictions, label='Transformer 예측', color='red', linestyle='--')
-ax.set_title(f'{most_frequent_menu} 메뉴의 7일 판매량 예측')
+ax.plot(test_menu_df.index, actual_test_values, label='실제 판매량 (TEST_00 ~ TEST_09)', color='green')
+ax.plot(test_menu_df.index, transformer_predictions, label='Transformer 예측', color='red', linestyle='--')
+
+ax.set_title(f'{most_frequent_menu} 메뉴의 전체 테스트 기간 판매량 예측')
 ax.set_xlabel('날짜')
 ax.set_ylabel('판매량')
 ax.legend()
 ax.grid(True)
+plt.tight_layout()
 plt.show()
