@@ -1,0 +1,264 @@
+import os
+import random
+import glob
+import re
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+import torch
+import torch.nn as nn
+from tqdm import tqdm
+
+# 난수 시드를 고정하여 재현 가능성을 확보하는 함수
+# 모델 훈련 시마다 동일한 결과를 얻기 위해 사용됩니다.
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
+# 하이퍼파라미터 설정
+LOOKBACK, PREDICT, BATCH_SIZE, EPOCHS = 28, 7, 16, 50
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+MODEL_PATH = 'trained_models.pth'
+
+# 2023년과 2024년 한국 공휴일 목록
+# 모델 학습에 중요한 피처로 사용됩니다.
+public_holidays = [
+    '2023-01-01', '2023-01-21', '2023-01-22', '2023-01-23', '2023-01-24',
+    '2023-03-01', '2023-05-01', '2023-05-05', '2023-05-27', '2023-06-06',
+    '2023-08-15', '2023-09-28', '2023-09-29', '2023-09-30', '2023-10-03',
+    '2023-10-09', '2023-12-25',
+    '2024-01-01', '2024-02-09', '2024-02-10', '2024-02-11', '2024-02-12',
+    '2024-03-01', '2024-04-10', '2024-05-01', '2024-05-05', '2024-05-06',
+    '2024-05-15', '2024-06-06', '2024-08-15', '2024-09-16', '2024-09-17',
+    '2024-09-18', '2024-10-03', '2024-10-09', '2024-12-25',
+]
+public_holidays = pd.to_datetime(public_holidays)
+
+# 데이터에 파생 변수를 추가하는 함수
+# 모델의 예측 성능을 높이는 핵심적인 부분입니다.
+def create_features(df):
+    # 날짜 정보를 활용한 파생 변수 생성
+    df['영업일자'] = pd.to_datetime(df['영업일자'])
+    df['dayofweek'] = df['영업일자'].dt.dayofweek
+    df['month'] = df['영업일자'].dt.month
+    df['dayofyear'] = df['영업일자'].dt.dayofyear
+    df['weekofyear'] = df['영업일자'].dt.isocalendar().week.astype(int)
+    df['quarter'] = df['영업일자'].dt.quarter
+    df['is_weekend'] = (df['영업일자'].dt.dayofweek >= 5).astype(int)
+
+    # 공휴일 피처 추가
+    df['is_public_holiday'] = df['영업일자'].isin(public_holidays).astype(int)
+
+    # 영업장별로 데이터를 정렬하여 시계열 처리를 준비
+    df.sort_values(['영업장명_메뉴명', '영업일자'], inplace=True)
+    # 7일 전의 매출을 나타내는 지연(lag) 피처 추가
+    df['lag_7'] = df.groupby('영업장명_메뉴명')['매출수량'].shift(7)
+    # 7일간의 이동평균 피처 추가
+    df['rolling_mean_7'] = df.groupby('영업장명_메뉴명')['매출수량'].transform(lambda x: x.rolling(window=7, min_periods=1).mean())
+    
+    # 영업장별 정기 휴무일 피처 추가 (매출이 95% 이상 0인 요일을 휴무일로 간주)
+    df['is_regular_closed_day'] = 0
+    grouped_by_day = df.groupby(['영업장명_메뉴명', 'dayofweek'])
+    zero_sales_percentage = grouped_by_day['매출수량'].apply(lambda x: (x == 0).sum() / len(x))
+    regular_closed_days = zero_sales_percentage[zero_sales_percentage > 0.95].index
+    
+    for store_menu, day in regular_closed_days:
+        mask = (df['영업장명_메뉴명'] == store_menu) & (df['dayofweek'] == day)
+        df.loc[mask, 'is_regular_closed_day'] = 1
+
+    # 지연 및 이동평균 피처 생성 시 발생하는 NaN 값을 0으로 채움
+    df.fillna(0, inplace=True)
+
+    return df
+
+# LSTM 모델 정의
+class MultiOutputLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, num_layers=2, output_dim=7):
+        super(MultiOutputLSTM, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+# 모델 훈련 함수
+def train_lstm(train_df):
+    trained_models = {}
+    features = ['매출수량', 'dayofweek', 'month', 'dayofyear', 'weekofyear', 'quarter', 'is_weekend', 'is_public_holiday', 'is_regular_closed_day', 'lag_7', 'rolling_mean_7']
+    
+    for store_menu, group in tqdm(train_df.groupby(['영업장명_메뉴명']), desc ='Training LSTM'):
+        store_train = group.sort_values('영업일자').copy()
+        if len(store_train) < LOOKBACK + PREDICT:
+            continue
+
+        # Min-Max 스케일링을 사용하여 데이터 정규화
+        scaler = MinMaxScaler()
+        store_train_scaled = scaler.fit_transform(store_train[features])
+        train_vals = store_train_scaled
+        
+        # LSTM 모델 입력에 맞는 시퀀스 데이터 구성
+        X_train, y_train = [], []
+        for i in range(len(train_vals) - LOOKBACK - PREDICT + 1):
+            X_train.append(train_vals[i:i+LOOKBACK])
+            y_train.append(train_vals[i+LOOKBACK:i+LOOKBACK+PREDICT, 0])
+
+        X_train = torch.tensor(np.array(X_train)).float().to(DEVICE)
+        y_train = torch.tensor(np.array(y_train)).float().to(DEVICE)
+
+        model = MultiOutputLSTM(input_dim=len(features), output_dim=PREDICT).to(DEVICE)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        criterion = nn.MSELoss()
+
+        model.train()
+        for epoch in range(EPOCHS):
+            idx = torch.randperm(len(X_train))
+            for i in range(0, len(X_train), BATCH_SIZE):
+                batch_idx = idx[i:i+BATCH_SIZE]
+                X_batch, y_batch = X_train[batch_idx], y_train[batch_idx]
+                output = model(X_batch)
+                loss = criterion(output, y_batch)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+        trained_models[store_menu] = {
+            'model': model.eval(),
+            'scaler': scaler,
+            'last_sequence_df': store_train[-LOOKBACK:]
+        }
+    
+    return trained_models
+
+# 모델 예측 함수
+def predict_lstm(test_df, trained_models, test_prefix: str):
+    results = []
+    
+    all_combined_df = pd.DataFrame()
+
+    for store_menu, store_test in test_df.groupby(['영업장명_메뉴명']):
+        key = store_menu
+        if key not in trained_models:
+            continue
+        last_sequence_df = trained_models[key]['last_sequence_df']
+        combined_df = pd.concat([last_sequence_df, store_test.sort_values('영업일자')], ignore_index=True)
+        all_combined_df = pd.concat([all_combined_df, combined_df], ignore_index=True)
+
+    all_combined_df = create_features(all_combined_df)
+
+    for store_menu, store_test in test_df.groupby(['영업장명_메뉴명']):
+        key = store_menu
+        if key not in trained_models:
+            continue
+        model = trained_models[key]['model']
+        scaler = trained_models[key]['scaler']
+
+        store_combined_df = all_combined_df[all_combined_df['영업장명_메뉴명'] == store_menu]
+        
+        features = ['매출수량', 'dayofweek', 'month', 'dayofyear', 'weekofyear', 'quarter', 'is_weekend', 'is_public_holiday', 'is_regular_closed_day', 'lag_7', 'rolling_mean_7']
+        recent_vals = store_combined_df[features].iloc[-LOOKBACK:].values
+
+        if len(recent_vals) < LOOKBACK:
+            continue
+
+        recent_vals = scaler.transform(recent_vals)
+        x_input = torch.tensor([recent_vals]).float().to(DEVICE)
+
+        with torch.no_grad():
+            pred_scaled = model(x_input).squeeze().cpu().numpy()
+
+        restored = []
+        for i in range(PREDICT):
+            dummy = np.zeros(len(features))
+            dummy[0] = pred_scaled[i]
+            restored_val = scaler.inverse_transform([dummy])[0, 0]
+            restored.append(max(restored_val, 0))
+
+        pred_dates = [f"{test_prefix}+{i+1}일" for i in range(PREDICT)]
+
+        for d, val in zip(pred_dates, restored):
+            results.append({
+                '영업일자': d,
+                '영업장명_메뉴명': store_menu,
+                '매출수량': val
+            })
+
+    return pd.DataFrame(results)
+
+# 예측 결과를 제출 양식에 맞추는 함수
+def convert_to_submission_format(pred_df: pd.DataFrame, sample_submission: pd.DataFrame):
+    # 'sample_submission.csv'의 열 이름에서 공백을 제거하여 KeyError를 방지합니다.
+    sample_submission.columns = sample_submission.columns.str.strip()
+    
+    # 예측 결과를 (영업일자, 메뉴명) -> 매출수량 딕셔너리로 변환하여 빠른 조회를 가능하게 합니다.
+    pred_dict = dict(zip(
+        zip(pred_df['영업일자'], pred_df['영업장명_메뉴명']),
+        pred_df['매출수량']
+    ))
+    # 제출 양식을 복사하여 최종 결과를 저장할 DataFrame을 만듭니다.
+    final_df = sample_submission.copy()
+    
+    # 제출 양식의 각 행을 순회하며 예측값을 채워넣습니다.
+    for row_idx in final_df.index:
+        # '영업일자' 열에 이름으로 접근합니다.
+        # 이전에 발생했던 KeyError는 pandas가 이 열 이름을 제대로 인식하지 못해 발생했습니다.
+        date = final_df.loc[row_idx, '영업일자']
+        # '영업일자' 열을 제외한 모든 메뉴 열을 순회합니다.
+        for col in final_df.columns[1:]:
+            # 예측 딕셔너리에서 해당 날짜와 메뉴에 대한 예측값을 찾아 할당합니다.
+            # 예측값이 없는 경우 기본값 0을 사용합니다.
+            final_df.loc[row_idx, col] = pred_dict.get((date, col), 0)
+    return final_df
+
+# 메인 실행 로직
+# 'trained_models.pth' 파일의 존재 여부에 따라 모델을 불러오거나 훈련시킵니다.
+if os.path.exists(MODEL_PATH):
+    print("사전 훈련된 모델이 발견되었습니다. 모델을 불러옵니다...")
+    trained_models = torch.load(MODEL_PATH)
+else:
+    print("사전 훈련된 모델이 발견되지 않았습니다. 모델을 새로 훈련합니다...")
+    # 'train.csv' 파일을 읽고, 열 이름에 숨겨진 문제가 있을 경우를 대비해 '영업일자' 열 이름을 강제 지정합니다.
+    train = pd.read_csv('./train.csv', encoding='utf-8-sig')
+    train.columns.values[0] = '영업일자'
+    train = create_features(train)
+    trained_models = train_lstm(train)
+    # 훈련된 모델을 파일로 저장하여 다음 실행 시 재훈련을 방지합니다.
+    torch.save(trained_models, MODEL_PATH)
+    print(f"모델이 훈련되어 {MODEL_PATH}에 저장되었습니다.")
+
+all_preds = []
+# 모든 TEST_*.csv 파일을 순회하며 예측을 수행합니다.
+test_files = sorted(glob.glob('./TEST_*.csv'))
+for path in test_files:
+    # 테스트 파일을 읽고, 열 이름에 숨겨진 문제가 있을 경우를 대비해 '영업일자' 열 이름을 강제 지정합니다.
+    test_df = pd.read_csv(path, encoding='utf-8-sig')
+    test_df.columns.values[0] = '영업일자'
+    filename = os.path.basename(path)
+    test_prefix = re.search(r'(TEST_\d+)', filename).group(1)
+    pred_df = predict_lstm(test_df, trained_models, test_prefix)
+    all_preds.append(pred_df)
+    
+full_pred_df = pd.concat(all_preds, ignore_index=True)
+
+# 최종 제출 파일을 생성합니다.
+if os.path.exists('./sample_submission.csv'):
+    # 'sample_submission.csv' 파일을 읽고, '영업일자' 열 이름을 강제 지정합니다.
+    sample_submission = pd.read_csv('./sample_submission.csv', encoding='utf-8-sig')
+    sample_submission.columns.values[0] = '영업일자'
+    submission = convert_to_submission_format(full_pred_df, sample_submission)
+    submission.to_csv('baseline_submission_with_features_and_holidays.csv', index=False, encoding='utf-8-sig')
+    print("Submission file 'baseline_submission_with_features_and_holidays.csv' created.")
+else:
+    print("sample_submission.csv not found. Skipping submission file creation.")
+    full_pred_df.to_csv('predictions_with_features_and_holidays.csv', index=False, encoding='utf-8-sig')
+    print("Prediction file 'predictions_with_features_and_holidays.csv' created.")
